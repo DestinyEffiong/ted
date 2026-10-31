@@ -176,8 +176,7 @@ html, body {
 .feed-empty h2 { margin: 0 0 6px; font-size: 20px; color: var(--ink); }
 .feed-empty p { margin: 0 auto; max-width: 30ch; line-height: 1.4; }
 
-@media (min-width: 768px) {
-  [hidden] { display: none !important; }
+[hidden] { display: none !important; }
 
 /* feed: dark by default, light when it has the .light class */
 #feed-view {
