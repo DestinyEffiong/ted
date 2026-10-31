@@ -8,7 +8,7 @@ use axum::{
     Json, Router,
 };
 use rand::{seq::SliceRandom, RngExt};
-use rusqlite::{params, Connection};
+use postgres::{Client, NoTls};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -71,9 +71,16 @@ struct App {
     next_id: AtomicU64,
     vapid: push::Vapid,
     agent: ureq::Agent,
-    db: Mutex<Connection>, // always lock this last, after any other lock
+    db: std::sync::mpsc::Sender<DbJob>, // database writes go to one background worker
 }
 type Shared = Arc<App>;
+type DbJob = Box<dyn FnOnce(&mut Client) + Send>;
+
+impl App {
+    fn save(&self, job: impl FnOnce(&mut Client) + Send + 'static) {
+        let _ = self.db.send(Box::new(job));
+    }
+}
 
 fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
@@ -85,46 +92,35 @@ fn valid_id(id: &str) -> bool {
 
 // ---------- database ----------
 
-fn add_column(db: &Connection, table: &str, column: &str, ddl: &str) {
-    let has = db
-        .prepare(&format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = '{column}'"))
-        .and_then(|mut s| s.exists([]))
-        .unwrap_or(false);
-    if !has {
-        let _ = db.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {ddl}"));
-    }
+fn connect() -> Result<Client, postgres::Error> {
+    let url = std::env::var("DATABASE_URL").expect("set DATABASE_URL");
+    Client::connect(&url, NoTls)
 }
 
-fn open_db() -> Connection {
-    let db = Connection::open("ted.db").expect("could not open ted.db");
-    db.execute_batch(
-        "PRAGMA journal_mode = WAL;
-         PRAGMA synchronous = NORMAL;
-         CREATE TABLE IF NOT EXISTS people (id TEXT PRIMARY KEY, lat REAL NOT NULL, lng REAL NOT NULL, seen_at INTEGER NOT NULL);
-         CREATE TABLE IF NOT EXISTS questions (id INTEGER PRIMARY KEY, text TEXT NOT NULL, at INTEGER NOT NULL);
-         CREATE TABLE IF NOT EXISTS replies (id INTEGER PRIMARY KEY, question_id INTEGER NOT NULL, parent INTEGER, text TEXT NOT NULL, at INTEGER NOT NULL, was_there INTEGER NOT NULL);
-         CREATE TABLE IF NOT EXISTS likes (question_id INTEGER NOT NULL, reply_id INTEGER NOT NULL, who TEXT NOT NULL, PRIMARY KEY (question_id, reply_id, who));
-         CREATE TABLE IF NOT EXISTS poll_options (question_id INTEGER NOT NULL, idx INTEGER NOT NULL, label TEXT NOT NULL, PRIMARY KEY (question_id, idx));
-         CREATE TABLE IF NOT EXISTS votes (question_id INTEGER NOT NULL, who TEXT NOT NULL, idx INTEGER NOT NULL, PRIMARY KEY (question_id, who));
+fn open_db() -> Client {
+    let mut db = connect().expect("could not connect to the database");
+    db.batch_execute(
+        "CREATE TABLE IF NOT EXISTS people (id TEXT PRIMARY KEY, lat DOUBLE PRECISION NOT NULL, lng DOUBLE PRECISION NOT NULL, seen_at BIGINT NOT NULL);
+         CREATE TABLE IF NOT EXISTS questions (id BIGINT PRIMARY KEY, text TEXT NOT NULL, made_at BIGINT NOT NULL, author TEXT);
+         CREATE TABLE IF NOT EXISTS replies (id BIGINT PRIMARY KEY, question_id BIGINT NOT NULL, parent BIGINT, text TEXT NOT NULL, made_at BIGINT NOT NULL, was_there BOOLEAN NOT NULL, author TEXT);
+         CREATE TABLE IF NOT EXISTS likes (question_id BIGINT NOT NULL, reply_id BIGINT NOT NULL, who TEXT NOT NULL, PRIMARY KEY (question_id, reply_id, who));
+         CREATE TABLE IF NOT EXISTS poll_options (question_id BIGINT NOT NULL, idx BIGINT NOT NULL, label TEXT NOT NULL, PRIMARY KEY (question_id, idx));
+         CREATE TABLE IF NOT EXISTS votes (question_id BIGINT NOT NULL, who TEXT NOT NULL, idx BIGINT NOT NULL, PRIMARY KEY (question_id, who));
          CREATE TABLE IF NOT EXISTS push (id TEXT PRIMARY KEY, endpoint TEXT NOT NULL, p256dh TEXT NOT NULL, auth TEXT NOT NULL);",
     )
     .expect("could not set up the database");
-    // older databases do not have these two columns yet
-    add_column(&db, "questions", "author", "TEXT");
-    add_column(&db, "replies", "author", "TEXT");
     db
 }
 
 // delete questions older than the cutoff, plus everything that belongs to them
-fn purge(db: &Connection, cutoff: u64) {
-    let _ = db.execute_batch(&format!(
-        "DELETE FROM questions WHERE at <= {c};
-         DELETE FROM replies WHERE question_id NOT IN (SELECT id FROM questions);
+fn purge(db: &mut Client, cutoff: u64) {
+    let _ = db.execute("DELETE FROM questions WHERE made_at <= $1", &[&(cutoff as i64)]);
+    let _ = db.batch_execute(
+        "DELETE FROM replies WHERE question_id NOT IN (SELECT id FROM questions);
          DELETE FROM likes WHERE question_id NOT IN (SELECT id FROM questions);
          DELETE FROM poll_options WHERE question_id NOT IN (SELECT id FROM questions);
          DELETE FROM votes WHERE question_id NOT IN (SELECT id FROM questions);",
-        c = cutoff
-    ));
+    );
 }
 
 struct Loaded {
@@ -135,128 +131,93 @@ struct Loaded {
 }
 
 // read everything back into memory when the server starts
-fn load(db: &Connection) -> Loaded {
+fn load(db: &mut Client) -> Loaded {
     let mut people = HashMap::new();
-    {
-        let mut stmt = db.prepare("SELECT id, lat, lng, seen_at FROM people").unwrap();
-        let rows = stmt
-            .query_map([], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?, r.get::<_, f64>(2)?, r.get::<_, i64>(3)?))
-            })
-            .unwrap();
-        for (id, lat, lng, seen) in rows.flatten() {
-            people.insert(id, Person { lat, lng, zone: zones::find_zone(lat, lng), seen_at: seen as u64 });
-        }
+    for r in db.query("SELECT id, lat, lng, seen_at FROM people", &[]).unwrap() {
+        let id: String = r.get(0);
+        let lat: f64 = r.get(1);
+        let lng: f64 = r.get(2);
+        let seen: i64 = r.get(3);
+        people.insert(id, Person { lat, lng, zone: zones::find_zone(lat, lng), seen_at: seen as u64 });
     }
 
     let mut subs = HashMap::new();
-    {
-        let mut stmt = db.prepare("SELECT id, endpoint, p256dh, auth FROM push").unwrap();
-        let rows = stmt
-            .query_map([], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?))
-            })
-            .unwrap();
-        for (id, endpoint, p256dh, auth) in rows.flatten() {
-            subs.insert(id, push::Sub { endpoint, p256dh, auth });
-        }
+    for r in db.query("SELECT id, endpoint, p256dh, auth FROM push", &[]).unwrap() {
+        let id: String = r.get(0);
+        subs.insert(id, push::Sub { endpoint: r.get(1), p256dh: r.get(2), auth: r.get(3) });
     }
 
     let mut feed: Vec<Question> = Vec::new();
     let mut next = 0u64;
+    for r in db.query("SELECT id, text, made_at, author FROM questions ORDER BY id", &[]).unwrap() {
+        let id: i64 = r.get(0);
+        let text: String = r.get(1);
+        let at: i64 = r.get(2);
+        let author: Option<String> = r.get(3);
+        next = next.max(id as u64 + 1);
+        feed.push(Question {
+            id: id as u64,
+            author,
+            place: zones::place_in_text(&text),
+            text,
+            at: at as u64,
+            likes: HashSet::new(),
+            options: Vec::new(),
+            replies: Vec::new(),
+        });
+    }
+    for r in db.query("SELECT question_id, label FROM poll_options ORDER BY question_id, idx", &[]).unwrap() {
+        let qid: i64 = r.get(0);
+        let label: String = r.get(1);
+        if let Some(q) = feed.iter_mut().find(|q| q.id == qid as u64) {
+            q.options.push(PollOption { label, votes: HashSet::new() });
+        }
+    }
+    for r in db.query("SELECT question_id, who, idx FROM votes", &[]).unwrap() {
+        let qid: i64 = r.get(0);
+        let who: String = r.get(1);
+        let idx: i64 = r.get(2);
+        if let Some(o) = feed
+            .iter_mut()
+            .find(|q| q.id == qid as u64)
+            .and_then(|q| q.options.get_mut(idx as usize))
+        {
+            o.votes.insert(who);
+        }
+    }
+    for r in db
+        .query("SELECT id, question_id, parent, text, made_at, was_there, author FROM replies ORDER BY id", &[])
+        .unwrap()
     {
-        let mut stmt = db.prepare("SELECT id, text, at, author FROM questions ORDER BY id").unwrap();
-        let rows = stmt
-            .query_map([], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, Option<String>>(3)?))
-            })
-            .unwrap();
-        for (id, text, at, author) in rows.flatten() {
-            next = next.max(id as u64 + 1);
-            feed.push(Question {
+        let id: i64 = r.get(0);
+        let qid: i64 = r.get(1);
+        let parent: Option<i64> = r.get(2);
+        let text: String = r.get(3);
+        let at: i64 = r.get(4);
+        let was_there: bool = r.get(5);
+        let author: Option<String> = r.get(6);
+        next = next.max(id as u64 + 1);
+        if let Some(q) = feed.iter_mut().find(|q| q.id == qid as u64) {
+            q.replies.push(Reply {
                 id: id as u64,
+                parent: parent.map(|p| p as u64),
                 author,
-                place: zones::place_in_text(&text),
                 text,
                 at: at as u64,
+                was_there,
                 likes: HashSet::new(),
-                options: Vec::new(),
-                replies: Vec::new(),
             });
         }
     }
-    {
-        let mut stmt = db
-            .prepare("SELECT question_id, label FROM poll_options ORDER BY question_id, idx")
-            .unwrap();
-        let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
-            .unwrap();
-        for (qid, label) in rows.flatten() {
-            if let Some(q) = feed.iter_mut().find(|q| q.id == qid as u64) {
-                q.options.push(PollOption { label, votes: HashSet::new() });
-            }
-        }
-    }
-    {
-        let mut stmt = db.prepare("SELECT question_id, who, idx FROM votes").unwrap();
-        let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))
-            .unwrap();
-        for (qid, who, idx) in rows.flatten() {
-            if let Some(o) = feed
-                .iter_mut()
-                .find(|q| q.id == qid as u64)
-                .and_then(|q| q.options.get_mut(idx as usize))
-            {
-                o.votes.insert(who);
-            }
-        }
-    }
-    {
-        let mut stmt = db
-            .prepare("SELECT id, question_id, parent, text, at, was_there, author FROM replies ORDER BY id")
-            .unwrap();
-        let rows = stmt
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, Option<i64>>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, i64>(4)?,
-                    r.get::<_, bool>(5)?,
-                    r.get::<_, Option<String>>(6)?,
-                ))
-            })
-            .unwrap();
-        for (id, qid, parent, text, at, was_there, author) in rows.flatten() {
-            next = next.max(id as u64 + 1);
-            if let Some(q) = feed.iter_mut().find(|q| q.id == qid as u64) {
-                q.replies.push(Reply {
-                    id: id as u64,
-                    parent: parent.map(|p| p as u64),
-                    author,
-                    text,
-                    at: at as u64,
-                    was_there,
-                    likes: HashSet::new(),
-                });
-            }
-        }
-    }
-    {
-        let mut stmt = db.prepare("SELECT question_id, reply_id, who FROM likes").unwrap();
-        let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?)))
-            .unwrap();
-        for (qid, rid, who) in rows.flatten() {
-            let Some(q) = feed.iter_mut().find(|q| q.id == qid as u64) else { continue };
-            if rid < 0 {
-                q.likes.insert(who);
-            } else if let Some(r) = q.replies.iter_mut().find(|r| r.id == rid as u64) {
-                r.likes.insert(who);
-            }
+    for r in db.query("SELECT question_id, reply_id, who FROM likes", &[]).unwrap() {
+        let qid: i64 = r.get(0);
+        let rid: i64 = r.get(1);
+        let who: String = r.get(2);
+        let Some(q) = feed.iter_mut().find(|q| q.id == qid as u64) else { continue };
+        if rid < 0 {
+            q.likes.insert(who);
+        } else if let Some(rep) = q.replies.iter_mut().find(|x| x.id == rid as u64) {
+            rep.likes.insert(who);
         }
     }
     Loaded { people, feed, subs, next }
@@ -305,11 +266,14 @@ async fn ping(
         p.id.clone(),
         Person { lat: p.lat, lng: p.lng, zone, seen_at: t },
     );
-    let _ = app.db.lock().unwrap().execute(
-        "INSERT INTO people (id, lat, lng, seen_at) VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT(id) DO UPDATE SET lat = ?2, lng = ?3, seen_at = ?4",
-        params![p.id, p.lat, p.lng, t as i64],
-    );
+    let (pid, plat, plng) = (p.id.clone(), p.lat, p.lng);
+    app.save(move |db| {
+        let _ = db.execute(
+            "INSERT INTO people (id, lat, lng, seen_at) VALUES ($1, $2, $3, $4)
+             ON CONFLICT (id) DO UPDATE SET lat = $2, lng = $3, seen_at = $4",
+            &[&pid, &plat, &plng, &(t as i64)],
+        );
+    });
     Ok(Json(PingReply { zone }))
 }
 
@@ -356,17 +320,24 @@ async fn subscribe(State(app): State<Shared>, Json(s): Json<SubscribeIn>) -> Sta
         return StatusCode::BAD_REQUEST;
     }
     let sub = push::Sub { endpoint: s.endpoint, p256dh: s.keys.p256dh, auth: s.keys.auth };
-    let _ = app.db.lock().unwrap().execute(
-        "INSERT OR REPLACE INTO push (id, endpoint, p256dh, auth) VALUES (?1, ?2, ?3, ?4)",
-        params![s.id, sub.endpoint, sub.p256dh, sub.auth],
-    );
+    let (sid, e, p, a) = (s.id.clone(), sub.endpoint.clone(), sub.p256dh.clone(), sub.auth.clone());
+    app.save(move |db| {
+        let _ = db.execute(
+            "INSERT INTO push (id, endpoint, p256dh, auth) VALUES ($1, $2, $3, $4)
+             ON CONFLICT (id) DO UPDATE SET endpoint = $2, p256dh = $3, auth = $4",
+            &[&sid, &e, &p, &a],
+        );
+    });
     app.subs.lock().unwrap().insert(s.id, sub);
     StatusCode::NO_CONTENT
 }
 
 async fn unsubscribe(State(app): State<Shared>, Json(u): Json<UnsubscribeIn>) -> StatusCode {
     app.subs.lock().unwrap().remove(&u.id);
-    let _ = app.db.lock().unwrap().execute("DELETE FROM push WHERE id = ?1", params![u.id]);
+    let uid = u.id.clone();
+    app.save(move |db| {
+        let _ = db.execute("DELETE FROM push WHERE id = $1", &[&uid]);
+    });
     StatusCode::NO_CONTENT
 }
 
@@ -451,7 +422,10 @@ fn dispatch(app: &Shared, targets: Vec<String>, payload: String) {
                 if subs.get(&id).map_or(false, |s| s.endpoint == sub.endpoint) {
                     subs.remove(&id);
                     drop(subs);
-                    let _ = app.db.lock().unwrap().execute("DELETE FROM push WHERE id = ?1", params![id]);
+                    let gone = id.clone();
+                    app.save(move |db| {
+                        let _ = db.execute("DELETE FROM push WHERE id = $1", &[&gone]);
+                    });
                 }
             }
         });
@@ -572,18 +546,21 @@ async fn ask(State(app): State<Shared>, Json(a): Json<Ask>) -> StatusCode {
     {
         let mut feed = app.feed.lock().unwrap();
         {
-            let db = app.db.lock().unwrap();
-            let _ = db.execute(
-                "INSERT INTO questions (id, text, at, author) VALUES (?1, ?2, ?3, ?4)",
-                params![q.id as i64, q.text, q.at as i64, a.id],
-            );
-            for (i, o) in q.options.iter().enumerate() {
+            let (q_id, q_text, q_at, who) = (q.id as i64, q.text.clone(), q.at as i64, a.id.clone());
+            let labels: Vec<String> = q.options.iter().map(|o| o.label.clone()).collect();
+            app.save(move |db| {
                 let _ = db.execute(
-                    "INSERT INTO poll_options (question_id, idx, label) VALUES (?1, ?2, ?3)",
-                    params![q.id as i64, i as i64, o.label],
+                    "INSERT INTO questions (id, text, made_at, author) VALUES ($1, $2, $3, $4)",
+                    &[&q_id, &q_text, &q_at, &who],
                 );
-            }
-            purge(&db, t.saturating_sub(QUESTION_LIFE_S));
+                for (i, label) in labels.iter().enumerate() {
+                    let _ = db.execute(
+                        "INSERT INTO poll_options (question_id, idx, label) VALUES ($1, $2, $3)",
+                        &[&q_id, &(i as i64), label],
+                    );
+                }
+                purge(db, t.saturating_sub(QUESTION_LIFE_S));
+            });
         }
         feed.retain(|q| t.saturating_sub(q.at) < QUESTION_LIFE_S);
         feed.push(q);
@@ -631,10 +608,16 @@ async fn reply(State(app): State<Shared>, Json(r): Json<ReplyIn>) -> StatusCode 
         };
         let was_there = q.place.is_some() && q.place == zone_now;
         let id = app.next_id.fetch_add(1, Ordering::Relaxed);
-        let _ = app.db.lock().unwrap().execute(
-            "INSERT INTO replies (id, question_id, parent, text, at, was_there, author) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![id as i64, q.id as i64, r.parent_id.map(|p| p as i64), text, t as i64, was_there, r.id],
-        );
+        {
+            let (rep_id, q_id, parent, rep_text, who) =
+                (id as i64, q.id as i64, r.parent_id.map(|p| p as i64), text.clone(), r.id.clone());
+            app.save(move |db| {
+                let _ = db.execute(
+                    "INSERT INTO replies (id, question_id, parent, text, made_at, was_there, author) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                    &[&rep_id, &q_id, &parent, &rep_text, &(t as i64), &was_there, &who],
+                );
+            });
+        }
         q.replies.push(Reply {
             id,
             parent: r.parent_id,
@@ -684,18 +667,20 @@ async fn like(State(app): State<Shared>, Json(l): Json<LikeIn>) -> StatusCode {
         true
     };
     let rid = l.reply_id.map_or(-1, |x| x as i64);
-    let db = app.db.lock().unwrap();
-    let _ = if added {
-        db.execute(
-            "INSERT OR IGNORE INTO likes (question_id, reply_id, who) VALUES (?1, ?2, ?3)",
-            params![l.question_id as i64, rid, l.id],
-        )
-    } else {
-        db.execute(
-            "DELETE FROM likes WHERE question_id = ?1 AND reply_id = ?2 AND who = ?3",
-            params![l.question_id as i64, rid, l.id],
-        )
-    };
+    let (q_id, who) = (l.question_id as i64, l.id.clone());
+    app.save(move |db| {
+        let _ = if added {
+            db.execute(
+                "INSERT INTO likes (question_id, reply_id, who) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+                &[&q_id, &rid, &who],
+            )
+        } else {
+            db.execute(
+                "DELETE FROM likes WHERE question_id = $1 AND reply_id = $2 AND who = $3",
+                &[&q_id, &rid, &who],
+            )
+        };
+    });
     StatusCode::NO_CONTENT
 }
 
@@ -715,10 +700,13 @@ async fn vote(State(app): State<Shared>, Json(v): Json<VoteIn>) -> StatusCode {
         return StatusCode::CONFLICT;
     }
     q.options[v.option].votes.insert(v.id.clone());
-    let _ = app.db.lock().unwrap().execute(
-        "INSERT OR IGNORE INTO votes (question_id, who, idx) VALUES (?1, ?2, ?3)",
-        params![v.question_id as i64, v.id, v.option as i64],
-    );
+    let (q_id, who, idx) = (v.question_id as i64, v.id.clone(), v.option as i64);
+    app.save(move |db| {
+        let _ = db.execute(
+            "INSERT INTO votes (question_id, who, idx) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+            &[&q_id, &who, &idx],
+        );
+    });
     StatusCode::NO_CONTENT
 }
 
@@ -769,11 +757,30 @@ async fn questions(State(app): State<Shared>, Query(me): Query<Me>) -> Json<Vec<
     Json(list)
 }
 
-#[tokio::main]
-async fn main() {
-    let db = open_db();
-    let vapid = push::vapid(&db);
-    let loaded = load(&db);
+fn main() {
+    let mut db = open_db();
+    let vapid = push::vapid(&mut db);
+    let loaded = load(&mut db);
+    let (tx, rx) = std::sync::mpsc::channel::<DbJob>();
+    std::thread::spawn(move || {
+        let mut db = db;
+        for job in rx {
+            if db.is_closed() {
+                if let Ok(c) = connect() {
+                    db = c;
+                }
+            }
+            job(&mut db);
+        }
+    });
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(serve(tx, vapid, loaded));
+}
+
+async fn serve(tx: std::sync::mpsc::Sender<DbJob>, vapid: push::Vapid, loaded: Loaded) {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .http_status_as_error(false)
         .timeout_global(Some(Duration::from_secs(8)))
@@ -787,7 +794,7 @@ async fn main() {
         next_id: AtomicU64::new(loaded.next),
         vapid,
         agent,
-        db: Mutex::new(db),
+        db: tx,
     });
 
     let router = Router::new()
@@ -803,7 +810,8 @@ async fn main() {
         .route("/api/push/unsubscribe", post(unsubscribe))
         .with_state(app);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    println!("ted is running on http://localhost:3000");
+    let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string());
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await.unwrap();
+    println!("ted is running on port {port}");
     axum::serve(listener, router).await.unwrap();
 }

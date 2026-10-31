@@ -1,5 +1,5 @@
 use base64ct::{Base64UrlUnpadded, Encoding};
-use rusqlite::{params, Connection};
+use postgres::Client;
 use serde::Deserialize;
 use web_push_native::{
     jwt_simple::algorithms::{ECDSAP256PublicKeyLike, ES256KeyPair},
@@ -34,21 +34,22 @@ pub enum Outcome {
     Failed, // temporary problem, keep it
 }
 
-// the server's identity keys are made once and kept in the database
-pub fn vapid(db: &Connection) -> Vapid {
-    db.execute_batch("CREATE TABLE IF NOT EXISTS settings (k TEXT PRIMARY KEY, v TEXT NOT NULL);")
+pub fn vapid(db: &mut Client) -> Vapid {
+    db.batch_execute("CREATE TABLE IF NOT EXISTS settings (k TEXT PRIMARY KEY, v TEXT NOT NULL);")
         .expect("settings table");
     let saved: Option<String> = db
-        .query_row("SELECT v FROM settings WHERE k = 'vapid_private'", [], |r| r.get(0))
-        .ok();
+        .query_opt("SELECT v FROM settings WHERE k = 'vapid_private'", &[])
+        .ok()
+        .flatten()
+        .map(|r| r.get(0));
     let pair = saved
         .and_then(|s| Base64UrlUnpadded::decode_vec(&s).ok())
         .and_then(|b| ES256KeyPair::from_bytes(&b).ok())
         .unwrap_or_else(|| {
             let pair = ES256KeyPair::generate();
             let _ = db.execute(
-                "INSERT OR REPLACE INTO settings (k, v) VALUES ('vapid_private', ?1)",
-                params![Base64UrlUnpadded::encode_string(&pair.to_bytes())],
+                "INSERT INTO settings (k, v) VALUES ('vapid_private', $1) ON CONFLICT (k) DO UPDATE SET v = $1",
+                &[&Base64UrlUnpadded::encode_string(&pair.to_bytes())],
             );
             pair
         });
