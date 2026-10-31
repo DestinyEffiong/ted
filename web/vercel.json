@@ -1,0 +1,5 @@
+{
+  "rewrites": [
+    { "source": "/api/:path*", "destination": "https://ted-zj31.onrender.com//api/:path*" }
+  ]
+}
