@@ -1,0 +1,8 @@
+target/
+node_modules/
+web/node_modules/
+web/dist/
+ted.db
+ted.db-shm
+ted.db-wal
+.env
