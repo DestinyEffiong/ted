@@ -467,6 +467,137 @@ function avatar() {
 }
 byId('composer-avatar').replaceWith(avatar())
 
+// ---------- profile (saved on this phone only) ----------
+const PROFILE_COLORS = ['#e0245e', '#f59e0b', '#16a34a', '#2f7cf6', '#8b5cf6', '#14b8a6']
+type Profile = { nick: string; color: string | null; photo: string | null }
+
+function loadProfile(): Profile {
+  try {
+    const p = JSON.parse(localStorage.getItem('ted-profile') || '{}')
+    return { nick: p.nick ?? '', color: p.color ?? null, photo: p.photo ?? null }
+  } catch {
+    return { nick: '', color: null, photo: null }
+  }
+}
+const profile = loadProfile()
+function saveProfile() {
+  try {
+    localStorage.setItem('ted-profile', JSON.stringify(profile))
+  } catch {
+    /* storage blocked, profile just will not be remembered */
+  }
+}
+
+// the round button, above the bell
+const profileBtn = el('button', 'fab')
+profileBtn.type = 'button'
+profileBtn.id = 'profile-btn'
+document.querySelector('.fabs')?.prepend(profileBtn)
+
+// the popup
+const sheet = el('div', 'p-sheet')
+sheet.hidden = true
+const card = el('div', 'p-card')
+const wrap = el('div', 'p-wrap')
+const big = el('div', 'p-avatar')
+const pencil = el('button', 'p-pencil')
+pencil.type = 'button'
+pencil.innerHTML = SVG('<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/>')
+wrap.append(big, pencil)
+const file = document.createElement('input')
+file.type = 'file'
+file.accept = 'image/*'
+file.hidden = true
+const swatches = el('div', 'p-colors')
+const nickLabel = el('label', 'p-label', 'Nickname')
+const nick = document.createElement('input')
+nick.className = 'p-input'
+nick.id = 'p-nick'
+nick.maxLength = 20
+nickLabel.htmlFor = 'p-nick'
+const done = el('button', 'p-done', 'Save')
+done.type = 'button'
+card.append(wrap, file, swatches, nickLabel, nick, done)
+sheet.append(card)
+document.body.append(sheet)
+
+function paintAvatar(box: HTMLElement) {
+  box.replaceChildren()
+  box.style.background = profile.color ?? ''
+  box.style.color = profile.color ? '#ffffff' : ''
+  if (profile.photo) {
+    const img = document.createElement('img')
+    img.src = profile.photo
+    img.alt = ''
+    box.append(img)
+  } else {
+    box.innerHTML = ICONS.person
+  }
+}
+
+function paintSwatches() {
+  swatches.replaceChildren()
+  for (const c of PROFILE_COLORS) {
+    const b = el('button', 'p-dot' + (profile.color === c && !profile.photo ? ' on' : ''))
+    b.type = 'button'
+    b.style.background = c
+    b.addEventListener('click', () => {
+      profile.color = c
+      profile.photo = null // a colour fills the circle, so it replaces the picture
+      refreshProfile()
+    })
+    swatches.append(b)
+  }
+}
+
+function refreshProfile() {
+  paintAvatar(big)
+  paintAvatar(profileBtn)
+  paintSwatches()
+  saveProfile()
+}
+
+function closeProfile() {
+  profile.nick = nick.value.trim().slice(0, 20)
+  saveProfile()
+  sheet.hidden = true
+}
+
+profileBtn.addEventListener('click', () => {
+  nick.value = profile.nick
+  refreshProfile()
+  sheet.hidden = false
+})
+done.addEventListener('click', closeProfile)
+sheet.addEventListener('click', (e) => {
+  if (e.target === sheet) closeProfile()
+})
+pencil.addEventListener('click', () => file.click())
+big.addEventListener('click', () => file.click())
+
+// picture: cropped to a small square so it stays tiny in storage
+file.addEventListener('change', () => {
+  const f = file.files?.[0]
+  file.value = ''
+  if (!f) return
+  const url = URL.createObjectURL(f)
+  const img = new Image()
+  img.onload = () => {
+    const size = 160
+    const side = Math.min(img.width, img.height)
+    const c = document.createElement('canvas')
+    c.width = size
+    c.height = size
+    c.getContext('2d')?.drawImage(img, (img.width - side) / 2, (img.height - side) / 2, side, side, 0, 0, size, size)
+    URL.revokeObjectURL(url)
+    profile.photo = c.toDataURL('image/jpeg', 0.8)
+    refreshProfile()
+  }
+  img.onerror = () => URL.revokeObjectURL(url)
+  img.src = url
+})
+paintAvatar(profileBtn)
+
 function head(secs: number, place?: string | null, wasThere?: boolean) {
   const h = el('div', 'head')
   h.append(el('strong', undefined, '~'))
