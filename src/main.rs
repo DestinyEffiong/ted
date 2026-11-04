@@ -3,12 +3,13 @@ mod zones;
 
 use axum::{
     extract::{Query, State},
-    http::StatusCode,
+    http::{header, StatusCode},
     routing::{get, post},
     Json, Router,
 };
-use rand::{seq::SliceRandom, RngExt};
+use base64ct::{Base64, Encoding};
 use postgres::{Client, NoTls};
+use rand::{seq::SliceRandom, RngExt};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -43,6 +44,7 @@ struct Reply {
     author: Option<String>,
     text: String,
     at: u64,
+    deleted: bool,
     was_there: bool,
     likes: HashSet<String>,
 }
@@ -63,8 +65,16 @@ struct Question {
     replies: Vec<Reply>,
 }
 
+struct Prof {
+    nick: Option<String>,
+    color: Option<String>,
+    photo: Option<Vec<u8>>,
+    v: u64, // changes when the profile is saved, so browsers fetch the new picture
+}
+
 struct App {
     people: Mutex<HashMap<String, Person>>,
+    profiles: Mutex<HashMap<String, Prof>>,
     feed: Mutex<Vec<Question>>,
     subs: Mutex<HashMap<String, push::Sub>>,
     sent: Mutex<HashMap<String, Vec<u64>>>, // push times per phone, for the hourly limit
@@ -106,7 +116,9 @@ fn open_db() -> Client {
          CREATE TABLE IF NOT EXISTS likes (question_id BIGINT NOT NULL, reply_id BIGINT NOT NULL, who TEXT NOT NULL, PRIMARY KEY (question_id, reply_id, who));
          CREATE TABLE IF NOT EXISTS poll_options (question_id BIGINT NOT NULL, idx BIGINT NOT NULL, label TEXT NOT NULL, PRIMARY KEY (question_id, idx));
          CREATE TABLE IF NOT EXISTS votes (question_id BIGINT NOT NULL, who TEXT NOT NULL, idx BIGINT NOT NULL, PRIMARY KEY (question_id, who));
-         CREATE TABLE IF NOT EXISTS push (id TEXT PRIMARY KEY, endpoint TEXT NOT NULL, p256dh TEXT NOT NULL, auth TEXT NOT NULL);",
+         CREATE TABLE IF NOT EXISTS push (id TEXT PRIMARY KEY, endpoint TEXT NOT NULL, p256dh TEXT NOT NULL, auth TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS profiles (id TEXT PRIMARY KEY, nick TEXT, color TEXT, photo BYTEA, v BIGINT NOT NULL DEFAULT 0);
+         ALTER TABLE replies ADD COLUMN IF NOT EXISTS deleted BOOLEAN NOT NULL DEFAULT FALSE;",
     )
     .expect("could not set up the database");
     db
@@ -127,6 +139,7 @@ struct Loaded {
     people: HashMap<String, Person>,
     feed: Vec<Question>,
     subs: HashMap<String, push::Sub>,
+    profiles: HashMap<String, Prof>,
     next: u64,
 }
 
@@ -186,7 +199,10 @@ fn load(db: &mut Client) -> Loaded {
         }
     }
     for r in db
-        .query("SELECT id, question_id, parent, text, made_at, was_there, author FROM replies ORDER BY id", &[])
+        .query(
+            "SELECT id, question_id, parent, text, made_at, was_there, author, deleted FROM replies ORDER BY id",
+            &[],
+        )
         .unwrap()
     {
         let id: i64 = r.get(0);
@@ -196,6 +212,7 @@ fn load(db: &mut Client) -> Loaded {
         let at: i64 = r.get(4);
         let was_there: bool = r.get(5);
         let author: Option<String> = r.get(6);
+        let deleted: bool = r.get(7);
         next = next.max(id as u64 + 1);
         if let Some(q) = feed.iter_mut().find(|q| q.id == qid as u64) {
             q.replies.push(Reply {
@@ -204,6 +221,7 @@ fn load(db: &mut Client) -> Loaded {
                 author,
                 text,
                 at: at as u64,
+                deleted,
                 was_there,
                 likes: HashSet::new(),
             });
@@ -220,7 +238,14 @@ fn load(db: &mut Client) -> Loaded {
             rep.likes.insert(who);
         }
     }
-    Loaded { people, feed, subs, next }
+
+    let mut profiles = HashMap::new();
+    for r in db.query("SELECT id, nick, color, photo, v FROM profiles", &[]).unwrap() {
+        let id: String = r.get(0);
+        let v: i64 = r.get(4);
+        profiles.insert(id, Prof { nick: r.get(1), color: r.get(2), photo: r.get(3), v: v as u64 });
+    }
+    Loaded { people, feed, subs, profiles, next }
 }
 
 // ---------- map ----------
@@ -472,6 +497,11 @@ struct ReplyView {
     was_there: bool,
     likes: usize,
     liked: bool,
+    deleted: bool,
+    mine: bool,
+    nick: Option<String>,
+    color: Option<String>,
+    photo: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -497,6 +527,10 @@ struct QuestionView {
     liked: bool,
     poll: Option<PollView>,
     replies: Vec<ReplyView>,
+    mine: bool,
+    nick: Option<String>,
+    color: Option<String>,
+    photo: Option<String>,
 }
 
 fn clean(text: &str, max: usize) -> Option<String> {
@@ -602,8 +636,8 @@ async fn reply(State(app): State<Shared>, Json(r): Json<ReplyIn>) -> StatusCode 
         let answered_author = match r.parent_id {
             None => q.author.clone(),
             Some(pid) => match q.replies.iter().find(|x| x.id == pid) {
-                Some(p) => p.author.clone(),
-                None => return StatusCode::NOT_FOUND,
+                Some(p) if !p.deleted => p.author.clone(),
+                _ => return StatusCode::NOT_FOUND,
             },
         };
         let was_there = q.place.is_some() && q.place == zone_now;
@@ -624,6 +658,7 @@ async fn reply(State(app): State<Shared>, Json(r): Json<ReplyIn>) -> StatusCode 
             author: Some(r.id.clone()),
             text: text.clone(),
             at: t,
+            deleted: false,
             was_there,
             likes: HashSet::new(),
         });
@@ -714,11 +749,16 @@ async fn questions(State(app): State<Shared>, Query(me): Query<Me>) -> Json<Vec<
     let t = now();
     let who = me.id.as_deref();
     let liked = |s: &HashSet<String>| who.map_or(false, |w| s.contains(w));
+    let profiles = app.profiles.lock().unwrap();
     let feed = app.feed.lock().unwrap();
     let mut list: Vec<QuestionView> = feed
         .iter()
         .filter(|q| t.saturating_sub(q.at) < QUESTION_LIFE_S)
         .map(|q| QuestionView {
+            mine: who.is_some() && q.author.as_deref() == who,
+            nick: face(&profiles, q.author.as_deref()).nick,
+            color: face(&profiles, q.author.as_deref()).color,
+            photo: face(&profiles, q.author.as_deref()).photo,
             id: q.id,
             text: q.text.clone(),
             seconds_ago: t.saturating_sub(q.at),
@@ -742,6 +782,11 @@ async fn questions(State(app): State<Shared>, Query(me): Query<Me>) -> Json<Vec<
                 .replies
                 .iter()
                 .map(|r| ReplyView {
+                    deleted: r.deleted,
+                    mine: who.is_some() && r.author.as_deref() == who,
+                    nick: face(&profiles, r.author.as_deref()).nick,
+                    color: face(&profiles, r.author.as_deref()).color,
+                    photo: face(&profiles, r.author.as_deref()).photo,
                     id: r.id,
                     parent: r.parent,
                     text: r.text.clone(),
@@ -755,6 +800,192 @@ async fn questions(State(app): State<Shared>, Query(me): Query<Me>) -> Json<Vec<
         .collect();
     list.reverse(); // newest first
     Json(list)
+}
+
+// ---------- profiles and delete ----------
+
+struct Face {
+    nick: Option<String>,
+    color: Option<String>,
+    photo: Option<String>,
+}
+
+// a short code for the picture link, so a phone id is never sent to other people
+fn key_of(id: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    ("ted", id).hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+fn face(profiles: &HashMap<String, Prof>, author: Option<&str>) -> Face {
+    match author.and_then(|a| profiles.get(a).map(|p| (a, p))) {
+        Some((a, p)) => Face {
+            nick: p.nick.clone(),
+            color: p.color.clone(),
+            photo: p.photo.as_ref().map(|_| format!("/api/avatar?k={}&v={}", key_of(a), p.v)),
+        },
+        None => Face { nick: None, color: None, photo: None },
+    }
+}
+
+#[derive(Deserialize)]
+struct ProfileIn {
+    id: String,
+    nick: Option<String>,
+    color: Option<String>,
+    photo: Option<String>, // a small jpeg as a data url
+}
+
+async fn set_profile(State(app): State<Shared>, Json(p): Json<ProfileIn>) -> StatusCode {
+    if !valid_id(&p.id) {
+        return StatusCode::BAD_REQUEST;
+    }
+    let nick = p.nick.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
+    if nick.as_ref().map_or(false, |n| n.chars().count() > 20) {
+        return StatusCode::BAD_REQUEST;
+    }
+    let color = p
+        .color
+        .filter(|c| c.len() == 7 && c.starts_with('#') && c[1..].chars().all(|ch| ch.is_ascii_hexdigit()));
+    let photo: Option<Vec<u8>> = match p.photo {
+        None => None,
+        Some(s) => {
+            let Some(b64) = s.strip_prefix("data:image/jpeg;base64,") else {
+                return StatusCode::BAD_REQUEST;
+            };
+            let Ok(bytes) = Base64::decode_vec(b64) else {
+                return StatusCode::BAD_REQUEST;
+            };
+            if bytes.len() > 60_000 || !bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+                return StatusCode::BAD_REQUEST;
+            }
+            Some(bytes)
+        }
+    };
+    let t = now();
+    app.profiles.lock().unwrap().insert(
+        p.id.clone(),
+        Prof { nick: nick.clone(), color: color.clone(), photo: photo.clone(), v: t },
+    );
+    let id = p.id.clone();
+    app.save(move |db| {
+        let _ = db.execute(
+            "INSERT INTO profiles (id, nick, color, photo, v) VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (id) DO UPDATE SET nick = $2, color = $3, photo = $4, v = $5",
+            &[&id, &nick, &color, &photo, &(t as i64)],
+        );
+    });
+    StatusCode::NO_CONTENT
+}
+
+#[derive(Deserialize)]
+struct AvatarQ {
+    k: String,
+}
+
+async fn avatar(
+    State(app): State<Shared>,
+    Query(q): Query<AvatarQ>,
+) -> Result<([(header::HeaderName, &'static str); 3], Vec<u8>), StatusCode> {
+    let profiles = app.profiles.lock().unwrap();
+    let bytes = profiles
+        .iter()
+        .find(|(id, _)| key_of(id) == q.k)
+        .and_then(|(_, p)| p.photo.clone())
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "image/jpeg"),
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        bytes,
+    ))
+}
+
+#[derive(Deserialize)]
+struct DeleteIn {
+    id: String,
+    question_id: u64,
+    reply_id: Option<u64>,
+}
+
+// only the phone that wrote it can delete it
+async fn delete_post(State(app): State<Shared>, Json(d): Json<DeleteIn>) -> StatusCode {
+    if !valid_id(&d.id) {
+        return StatusCode::BAD_REQUEST;
+    }
+    let mut feed = app.feed.lock().unwrap();
+    let Some(pos) = feed.iter().position(|q| q.id == d.question_id) else {
+        return StatusCode::NOT_FOUND;
+    };
+    let qid = d.question_id as i64;
+    match d.reply_id {
+        None => {
+            if feed[pos].author.as_deref() != Some(d.id.as_str()) {
+                return StatusCode::FORBIDDEN;
+            }
+            feed.remove(pos);
+            app.save(move |db| {
+                let _ = db.execute("DELETE FROM questions WHERE id = $1", &[&qid]);
+                let _ = db.batch_execute(
+                    "DELETE FROM replies WHERE question_id NOT IN (SELECT id FROM questions);
+                     DELETE FROM likes WHERE question_id NOT IN (SELECT id FROM questions);
+                     DELETE FROM poll_options WHERE question_id NOT IN (SELECT id FROM questions);
+                     DELETE FROM votes WHERE question_id NOT IN (SELECT id FROM questions);",
+                );
+            });
+        }
+        Some(rid) => {
+            let q = &mut feed[pos];
+            let Some(i) = q.replies.iter().position(|r| r.id == rid) else {
+                return StatusCode::NOT_FOUND;
+            };
+            if q.replies[i].author.as_deref() != Some(d.id.as_str()) {
+                return StatusCode::FORBIDDEN;
+            }
+            if q.replies.iter().any(|r| r.parent == Some(rid)) {
+                // it has answers under it, so keep a grey "deleted" line in its place
+                let r = &mut q.replies[i];
+                r.deleted = true;
+                r.text = String::new();
+                r.author = None;
+                r.likes.clear();
+                let r64 = rid as i64;
+                app.save(move |db| {
+                    let _ = db.execute(
+                        "UPDATE replies SET deleted = TRUE, text = '', author = NULL WHERE id = $1",
+                        &[&r64],
+                    );
+                    let _ = db.execute("DELETE FROM likes WHERE question_id = $1 AND reply_id = $2", &[&qid, &r64]);
+                });
+            } else {
+                // nothing under it: remove it, and any empty "deleted" lines above it
+                let mut gone = vec![rid];
+                let mut cur = q.replies[i].parent;
+                q.replies.remove(i);
+                while let Some(pid) = cur {
+                    let Some(j) = q.replies.iter().position(|r| r.id == pid) else { break };
+                    if q.replies[j].deleted && !q.replies.iter().any(|r| r.parent == Some(pid)) {
+                        cur = q.replies[j].parent;
+                        q.replies.remove(j);
+                        gone.push(pid);
+                    } else {
+                        break;
+                    }
+                }
+                app.save(move |db| {
+                    for g in gone {
+                        let g = g as i64;
+                        let _ = db.execute("DELETE FROM replies WHERE id = $1", &[&g]);
+                        let _ = db.execute("DELETE FROM likes WHERE question_id = $1 AND reply_id = $2", &[&qid, &g]);
+                    }
+                });
+            }
+        }
+    }
+    StatusCode::NO_CONTENT
 }
 
 fn main() {
@@ -788,6 +1019,7 @@ async fn serve(tx: std::sync::mpsc::Sender<DbJob>, vapid: push::Vapid, loaded: L
         .into();
     let app: Shared = Arc::new(App {
         people: Mutex::new(loaded.people),
+        profiles: Mutex::new(loaded.profiles),
         feed: Mutex::new(loaded.feed),
         subs: Mutex::new(loaded.subs),
         sent: Mutex::new(HashMap::new()),
@@ -805,6 +1037,9 @@ async fn serve(tx: std::sync::mpsc::Sender<DbJob>, vapid: push::Vapid, loaded: L
         .route("/api/reply", post(reply))
         .route("/api/like", post(like))
         .route("/api/vote", post(vote))
+        .route("/api/profile", post(set_profile))
+        .route("/api/avatar", get(avatar))
+        .route("/api/delete", post(delete_post))
         .route("/api/push/key", get(push_key))
         .route("/api/push/subscribe", post(subscribe))
         .route("/api/push/unsubscribe", post(unsubscribe))

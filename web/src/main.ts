@@ -36,7 +36,7 @@ function ago(s: number): string {
   if (s < 60) return 'just now'
   const m = Math.floor(s / 60)
   if (m < 60) return `${m} min ago`
-    const h = Math.floor(m / 60)
+  const h = Math.floor(m / 60)
   if (h < 24) return `${h} h ago`
   return `${Math.floor(h / 24)} d ago`
 }
@@ -218,7 +218,7 @@ map.on('load', () => {
       .setText(`Someone, ${zone}, ${ago(age)}`)
       .addTo(map)
   })
-    map.on('click', 'me', () => {
+  map.on('click', 'me', () => {
     if (!mine) return
     new maplibregl.Popup({ closeButton: false, offset: 14 })
       .setLngLat([mine.lng, mine.lat])
@@ -379,6 +379,11 @@ type ReplyT = {
   was_there: boolean
   likes: number
   liked: boolean
+  deleted: boolean
+  mine: boolean
+  nick: string | null
+  color: string | null
+  photo: string | null
 }
 type PollT = { options: { label: string; votes: number }[]; total: number; mine: number | null }
 type Question = {
@@ -390,6 +395,10 @@ type Question = {
   liked: boolean
   poll: PollT | null
   replies: ReplyT[]
+  mine: boolean
+  nick: string | null
+  color: string | null
+  photo: string | null
 }
 
 const SVG = (inner: string, fill = 'none') =>
@@ -404,6 +413,7 @@ const ICONS = {
   bellOff: SVG(BELL_PATH + '<path d="M3 3l18 18"/>'),
   sun: SVG('<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>'),
   moon: SVG('<path d="M21 13A9 9 0 1 1 11 3a7 7 0 0 0 10 10z"/>'),
+  trash: SVG('<path d="M4 7h16"/><path d="M9 7V4h6v3"/><path d="M6 7l1 13h10l1-13"/><path d="M10 11v6M14 11v6"/>'),
 }
 
 const feedHome = byId('feed-home')
@@ -460,14 +470,26 @@ function syncChrome() {
   document.body.classList.toggle('in-thread', openId !== null && views.feed.classList.contains('active'))
 }
 
-function avatar() {
+function avatar(f?: { color?: string | null; photo?: string | null }) {
   const a = el('div', 'avatar')
-  a.innerHTML = ICONS.person
+  if (f?.photo) {
+    const img = document.createElement('img')
+    img.src = f.photo
+    img.alt = ''
+    a.append(img)
+  } else {
+    a.innerHTML = ICONS.person
+    if (f?.color) {
+      a.style.background = f.color
+      a.style.color = '#ffffff'
+    }
+  }
   return a
 }
-byId('composer-avatar').replaceWith(avatar())
+const composerAv = avatar()
+byId('composer-avatar').replaceWith(composerAv)
 
-// ---------- profile (saved on this phone only) ----------
+// ---------- profile (saved on this phone, and sent to the server so others see it) ----------
 const PROFILE_COLORS = ['#e0245e', '#f59e0b', '#16a34a', '#2f7cf6', '#8b5cf6', '#14b8a6']
 type Profile = { nick: string; color: string | null; photo: string | null }
 
@@ -553,14 +575,21 @@ function paintSwatches() {
 function refreshProfile() {
   paintAvatar(big)
   paintAvatar(profileBtn)
+  paintAvatar(composerAv)
   paintSwatches()
   saveProfile()
+}
+
+async function pushProfile() {
+  await post('/api/profile', { id: ID, nick: profile.nick || null, color: profile.color, photo: profile.photo })
+  loadFeed(true)
 }
 
 function closeProfile() {
   profile.nick = nick.value.trim().slice(0, 20)
   saveProfile()
   sheet.hidden = true
+  pushProfile()
 }
 
 profileBtn.addEventListener('click', () => {
@@ -597,18 +626,20 @@ file.addEventListener('change', () => {
   img.src = url
 })
 paintAvatar(profileBtn)
+paintAvatar(composerAv)
+if (profile.nick || profile.color || profile.photo) pushProfile()
 
-function head(secs: number, place?: string | null, wasThere?: boolean) {
+function head(secs: number, place?: string | null, wasThere?: boolean, nickName?: string | null) {
   const h = el('div', 'head')
-  h.append(el('strong', undefined, '~'))
+  h.append(el('strong', undefined, nickName || '~'))
   if (wasThere) h.append(el('span', 'tag', 'was there'))
   if (place) h.append(el('span', 'place', place))
   h.append(el('span', 'muted', ago(secs)))
   return h
 }
 
-function action(kind: 'heart' | 'comment', count: number, on = false, click?: () => void) {
-  const b = el('button', 'act' + (on ? ' on' : ''))
+function action(kind: 'heart' | 'comment' | 'trash', count: number, on = false, click?: () => void) {
+  const b = el('button', 'act' + (on ? ' on' : '') + (kind === 'trash' ? ' del' : ''))
   b.type = 'button'
   b.innerHTML = ICONS[kind]
   if (count > 0) b.append(el('span', undefined, String(count)))
@@ -641,6 +672,50 @@ async function toggleLike(q: Question, r?: ReplyT) {
   const ok = await post('/api/like', { id: ID, question_id: q.id, reply_id: r ? r.id : null })
   if (!ok) loadFeed(true)
 }
+
+// ---------- delete ----------
+let pendingDelete: { q: Question; r?: ReplyT } | null = null
+
+const dsheet = el('div', 'p-sheet')
+dsheet.hidden = true
+const dcard = el('div', 'p-card')
+const dtitle = el('p', 'd-title', 'Delete this post?')
+const drow = el('div', 'd-row')
+const dcancel = el('button', 'd-cancel', 'Cancel')
+dcancel.type = 'button'
+const dgo = el('button', 'd-go', 'Delete')
+dgo.type = 'button'
+drow.append(dcancel, dgo)
+dcard.append(dtitle, drow)
+dsheet.append(dcard)
+document.body.append(dsheet)
+
+function askDelete(q: Question, r?: ReplyT) {
+  pendingDelete = { q, r }
+  dtitle.textContent = r ? 'Delete this reply?' : 'Delete this post?'
+  dsheet.hidden = false
+}
+function closeDelete() {
+  dsheet.hidden = true
+  pendingDelete = null
+}
+dcancel.addEventListener('click', closeDelete)
+dsheet.addEventListener('click', (e) => {
+  if (e.target === dsheet) closeDelete()
+})
+dgo.addEventListener('click', async () => {
+  const p = pendingDelete
+  closeDelete()
+  if (!p) return
+  const ok = await post('/api/delete', { id: ID, question_id: p.q.id, reply_id: p.r ? p.r.id : null })
+  if (!ok) {
+    toast('Could not delete. Try again.')
+    return
+  }
+  if (p.r && target === p.r.id) setTarget(null)
+  if (!p.r && openId === p.q.id) history.back()
+  loadFeed(true)
+})
 
 // ---------- polls ----------
 async function vote(q: Question, i: number) {
@@ -695,11 +770,12 @@ function renderHome() {
     const main = el('div')
     const acts = el('div', 'acts')
     acts.append(action('heart', q.likes, q.liked, () => toggleLike(q)), action('comment', q.replies.length))
-    main.append(head(q.seconds_ago, q.place), el('p', 'text', q.text))
+    if (q.mine) acts.append(action('trash', 0, false, () => askDelete(q)))
+    main.append(head(q.seconds_ago, q.place, false, q.nick), el('p', 'text', q.text))
     const poll = pollBox(q)
     if (poll) main.append(poll)
     main.append(acts)
-    row.append(avatar(), main)
+    row.append(avatar(q), main)
     row.addEventListener('click', () => openThread(q.id))
     feedList.append(row)
   }
@@ -710,12 +786,13 @@ function renderThread(q: Question) {
 
   const root = el('article', 'root')
   const top = el('div', 'root-top')
-  top.append(avatar(), head(q.seconds_ago, q.place))
+  top.append(avatar(q), head(q.seconds_ago, q.place, false, q.nick))
   const rootActs = el('div', 'acts')
   rootActs.append(
     action('heart', q.likes, q.liked, () => toggleLike(q)),
     action('comment', q.replies.length, false, () => pickTarget(null)),
   )
+  if (q.mine) rootActs.append(action('trash', 0, false, () => askDelete(q)))
   root.append(top, el('p', 'text big', q.text))
   const poll = pollBox(q)
   if (poll) root.append(poll)
@@ -736,14 +813,19 @@ function renderThread(q: Question) {
       const row = el('div', 'rep')
       const main = el('div')
       const acts = el('div', 'acts')
-      acts.append(
-        action('heart', r.likes, r.liked, () => toggleLike(q, r)),
-        action('comment', (kids.get(r.id) ?? []).length, false, () => pickTarget(r)),
-      )
-      main.append(head(r.seconds_ago, null, r.was_there), el('p', 'text', r.text), acts)
+      if (r.deleted) {
+        main.append(el('p', 'text gone', 'deleted'))
+      } else {
+        acts.append(
+          action('heart', r.likes, r.liked, () => toggleLike(q, r)),
+          action('comment', (kids.get(r.id) ?? []).length, false, () => pickTarget(r)),
+        )
+        if (r.mine) acts.append(action('trash', 0, false, () => askDelete(q, r)))
+        main.append(head(r.seconds_ago, null, r.was_there, r.nick), el('p', 'text', r.text), acts)
+      }
       const children = build(r.id, depth + 1)
       const av = el('div', children.length > 0 && depth < 2 ? 'av line' : 'av')
-      av.append(avatar())
+      av.append(avatar(r.deleted ? undefined : r))
       row.append(av, main)
       node.append(row)
       if (children.length > 0) {
