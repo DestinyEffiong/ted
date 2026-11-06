@@ -716,3 +716,41 @@ html, body {
 }
 .d-cancel { background: #ece9df; color: #16160f; }
 .d-go { background: #e0245e; color: #ffffff; }
+
+/* location on / off, same size as the 3D button, sits above it */
+#loc-btn {
+  position: absolute;
+  right: 14px;
+  bottom: calc(218px + env(safe-area-inset-bottom));
+  z-index: 5;
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  border: 1px solid #4a463d;
+  background: #1f1d18;
+  color: #8f8b80;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  cursor: pointer;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.25);
+}
+#loc-btn svg { width: 26px; height: 26px; }
+#loc-btn.on {
+  color: #2f7cf6;
+  border-color: #2f7cf6;
+  box-shadow: 0 0 0 2px rgba(47, 124, 246, 0.35), 0 2px 10px rgba(0, 0, 0, 0.25);
+}
+@media (min-width: 768px) {
+  #loc-btn { bottom: 142px; }
+}
+
+/* reset circle in the profile popup */
+.p-reset {
+  background: #3a3730;
+  color: #8f8b80;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+}
+.p-reset svg { width: 11px; height: 11px; }

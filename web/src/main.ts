@@ -300,8 +300,19 @@ function sendPing() {
     .catch(() => {})
 }
 
-if ('geolocation' in navigator) {
-  navigator.geolocation.watchPosition(
+let watchId: number | null = null
+let locOn = true
+try {
+  locOn = localStorage.getItem('ted-location') !== 'off'
+} catch {
+  /* ignore */
+}
+
+function startWatch() {
+  if (!('geolocation' in navigator) || watchId !== null) return
+  firstFix = true
+  lastPing = 0
+  watchId = navigator.geolocation.watchPosition(
     (pos) => {
       mine = { lat: pos.coords.latitude, lng: pos.coords.longitude }
       setMe()
@@ -318,6 +329,54 @@ if ('geolocation' in navigator) {
     { enableHighAccuracy: true, maximumAge: 5000 },
   )
 }
+
+function stopWatch() {
+  if (watchId !== null) navigator.geolocation.clearWatch(watchId)
+  watchId = null
+  mine = null
+  myZone = null
+  ;(map.getSource('me') as maplibregl.GeoJSONSource | undefined)?.setData({
+    type: 'FeatureCollection',
+    features: [],
+  })
+}
+
+// the round location button, above the 3D button
+const PIN = '<path d="M12 21s-7-6.2-7-11a7 7 0 0 1 14 0c0 4.8-7 11-7 11z"/><circle cx="12" cy="10" r="2.5"/>'
+const pinSvg = (inner: string) =>
+  `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${inner}</svg>`
+
+const locBtn = document.createElement('button')
+locBtn.type = 'button'
+locBtn.id = 'loc-btn'
+byId('map-view').append(locBtn)
+
+function paintLoc() {
+  locBtn.classList.toggle('on', locOn)
+  locBtn.innerHTML = pinSvg(locOn ? PIN : PIN + '<path d="M3 3l18 18"/>')
+  locBtn.setAttribute('aria-pressed', String(locOn))
+  locBtn.setAttribute('aria-label', locOn ? 'Turn location off' : 'Turn location on')
+}
+paintLoc()
+if (locOn) startWatch()
+
+locBtn.addEventListener('click', () => {
+  locOn = !locOn
+  try {
+    localStorage.setItem('ted-location', locOn ? 'on' : 'off')
+  } catch {
+    /* ignore */
+  }
+  paintLoc()
+  if (locOn) {
+    startWatch()
+    toast('Location is on.')
+  } else {
+    stopWatch()
+    post('/api/leave', { id: ID }) // the server forgets your dot straight away
+    toast('Location is off.')
+  }
+})
 
 byId('locate').addEventListener('click', () => {
   if (mine) map.flyTo({ center: [mine.lng, mine.lat], zoom: 18 })
@@ -490,7 +549,7 @@ const composerAv = avatar()
 byId('composer-avatar').replaceWith(composerAv)
 
 // ---------- profile (saved on this phone, and sent to the server so others see it) ----------
-const PROFILE_COLORS = ['#e0245e', '#f59e0b', '#16a34a', '#2f7cf6', '#8b5cf6', '#14b8a6']
+const PROFILE_COLORS = ['#e0245e', '#f59e0b', '#16a34a', '#2f7cf6', '#8b5cf6']
 type Profile = { nick: string; color: string | null; photo: string | null }
 
 function loadProfile(): Profile {
@@ -570,6 +629,16 @@ function paintSwatches() {
     })
     swatches.append(b)
   }
+  // last circle: back to the default grey person
+  const reset = el('button', 'p-dot p-reset' + (!profile.color && !profile.photo ? ' on' : ''))
+  reset.type = 'button'
+  reset.innerHTML = ICONS.person
+  reset.addEventListener('click', () => {
+    profile.color = null
+    profile.photo = null
+    refreshProfile()
+  })
+  swatches.append(reset)
 }
 
 function refreshProfile() {

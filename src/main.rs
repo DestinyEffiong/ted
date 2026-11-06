@@ -302,6 +302,24 @@ async fn ping(
     Ok(Json(PingReply { zone }))
 }
 
+#[derive(Deserialize)]
+struct LeaveIn {
+    id: String,
+}
+
+// location switched off: forget this phone's dot right away
+async fn leave(State(app): State<Shared>, Json(l): Json<LeaveIn>) -> StatusCode {
+    if !valid_id(&l.id) {
+        return StatusCode::BAD_REQUEST;
+    }
+    app.people.lock().unwrap().remove(&l.id);
+    let id = l.id.clone();
+    app.save(move |db| {
+        let _ = db.execute("DELETE FROM people WHERE id = $1", &[&id]);
+    });
+    StatusCode::NO_CONTENT
+}
+
 async fn dots(State(app): State<Shared>, Query(me): Query<Me>) -> Json<Vec<Dot>> {
     let t = now();
     let map = app.people.lock().unwrap();
@@ -1031,6 +1049,7 @@ async fn serve(tx: std::sync::mpsc::Sender<DbJob>, vapid: push::Vapid, loaded: L
 
     let router = Router::new()
         .route("/api/ping", post(ping))
+        .route("/api/leave", post(leave))
         .route("/api/dots", get(dots))
         .route("/api/zones", get(zone_list))
         .route("/api/questions", get(questions).post(ask))
